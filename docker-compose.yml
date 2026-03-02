@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  pdf-generator:
+    build: .
+    ports:
+      - "5000:8080"
+    volumes:
+      - pdf_data:/data
+    environment:
+      - DATA_DIR=/data
+      - PORT=8080
+    restart: unless-stopped
+
+volumes:
+  pdf_data:
