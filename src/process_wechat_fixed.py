@@ -11,7 +11,7 @@ import hashlib
 import datetime
 from pathlib import Path
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 import re
 
 # 导入修复版PDF生成器
@@ -46,41 +46,250 @@ class WeChatArticleFixer:
         
         print("📁 系统目录结构已创建")
     
-    def fetch_article(self, url):
-        """抓取文章内容并正确格式化"""
+    def fetch_article(self, url, use_browser_fallback=False, use_remote_fallback=False):
+        """抓取文章内容并正确格式化（增强成功率：重试/多UA/URL规范化）"""
         print(f"🌐 抓取文章: {url}")
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        }
-        
+        print(f"   浏览器兜底: {'开启' if use_browser_fallback else '关闭'}")
+        print(f"   远程兜底: {'开启' if use_remote_fallback else '关闭'}")
+
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        def normalize_url(raw_url: str):
+            raw_url = (raw_url or '').strip().replace('&amp;', '&')
+            if not raw_url.startswith('http'):
+                raw_url = 'https://' + raw_url.lstrip('/')
+
+            u = urlparse(raw_url)
+            # 只处理微信域名
+            if 'mp.weixin.qq.com' not in (u.netloc or ''):
+                return [raw_url]
+
+            # 尽量保留关键参数，减少无关参数干扰
+            q = parse_qs(u.query, keep_blank_values=True)
+            keep_keys = ['__biz', 'mid', 'idx', 'sn', 'chksm', 'scene', 'srcid']
+            clean_q = {k: v for k, v in q.items() if k in keep_keys and v}
+            query = urlencode(clean_q, doseq=True)
+
+            canonical = urlunparse((u.scheme or 'https', u.netloc, u.path, '', query, ''))
+            # 候选URL：原始 + 规范化（去fragment）
+            no_frag = urlunparse((u.scheme or 'https', u.netloc, u.path, '', u.query, ''))
+            return list(dict.fromkeys([raw_url, no_frag, canonical]))
+
+        url_candidates = normalize_url(url)
+
+        request_profiles = [
+            {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Referer': 'https://mp.weixin.qq.com/',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
+            },
+            {
+                # 手机UA有时更容易拿到正文
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'Referer': 'https://mp.weixin.qq.com/',
+            },
+        ]
+
+        # 记录最后一次错误，便于前端展示
+        last_error = None
+
+        for candidate in url_candidates:
+            for headers in request_profiles:
+                try:
+                    response = requests.get(candidate, headers=headers, timeout=(8, 20), allow_redirects=True)
+                    response.raise_for_status()
+
+                    # 编码兜底
+                    if not response.encoding:
+                        response.encoding = response.apparent_encoding or 'utf-8'
+
+                    html_text = response.text
+                    soup = BeautifulSoup(html_text, 'html.parser')
+
+                    # 常见被拦截页面特征
+                    text_sample = soup.get_text(' ', strip=True)[:1200]
+                    blocked_markers = ['环境异常', '访问过于频繁', '请在微信客户端打开链接', '该内容因违规无法查看']
+                    if any(m in text_sample for m in blocked_markers):
+                        last_error = f'微信侧限制访问（{candidate}）'
+                        continue
+
+                    # 提取信息
+                    title = self._extract_title(soup)
+                    author = self._extract_author(soup)
+                    content = self._extract_and_format_content(soup)
+
+                    if content and len(content) > 100:
+                        return {
+                            'success': True,
+                            'title': title or '未获取到标题',
+                            'author': author or '未知作者',
+                            'content': content,
+                            'raw_html': str(soup),
+                            'source_url': candidate,
+                        }
+
+                    # 内容过短，也算失败并继续尝试下一个配置
+                    last_error = f'内容提取不足（len={len(content) if content else 0}）'
+
+                except Exception as e:
+                    last_error = str(e)
+                    continue
+
+        # requests路径失败后，先走远程兜底（无sudo）
+        if use_remote_fallback:
+            remote_result = self._fetch_article_via_remote(url)
+            if remote_result.get('success'):
+                return remote_result
+            last_error = f"{last_error or 'requests失败'}; 远程兜底失败: {remote_result.get('error', '未知错误')}"
+
+        # 再按开关决定是否启用浏览器兜底
+        if use_browser_fallback:
+            browser_result = self._fetch_article_via_browser(url)
+            if browser_result.get('success'):
+                return browser_result
+            last_error = f"{last_error or 'requests失败'}; 浏览器兜底失败: {browser_result.get('error', '未知错误')}"
+
+        print(f"❌ 抓取失败: {last_error}")
+        return {'success': False, 'error': last_error or '未知错误'}
+    
+    def _fetch_article_via_remote(self, url):
+        """远程渲染兜底（无sudo）：默认使用 r.jina.ai 可读代理"""
         try:
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # 提取信息
+            from urllib.parse import quote
+            # 可通过环境变量覆盖
+            remote_prefix = os.environ.get('REMOTE_FETCH_PREFIX', 'https://r.jina.ai/http://')
+            target = url
+            if target.startswith('https://'):
+                target = target[len('https://'):]
+            elif target.startswith('http://'):
+                target = target[len('http://'):]
+            remote_url = remote_prefix + target
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0',
+                'Accept': 'text/plain,text/markdown,*/*'
+            }
+            r = requests.get(remote_url, headers=headers, timeout=(8, 25))
+            r.raise_for_status()
+            text = r.text.strip()
+            if len(text) < 120:
+                return {'success': False, 'error': f'远程返回内容过短(len={len(text)})'}
+
+            # 从可读文本里猜标题
+            title = None
+            for line in text.splitlines()[:20]:
+                s = line.strip('# ').strip()
+                if len(s) >= 6 and 'http' not in s.lower():
+                    title = s
+                    break
+
+            # 直接作为正文（markdown风格）
+            return {
+                'success': True,
+                'title': title or '未获取到标题',
+                'author': '未知作者',
+                'content': text,
+                'raw_html': '',
+                'source_url': url,
+                'fetched_by': 'remote_fallback'
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def _fetch_article_via_browser(self, url):
+        """浏览器兜底抓取（Playwright，可选依赖）"""
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as e:
+            return {'success': False, 'error': f'Playwright不可用: {e}'}
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=['--no-sandbox', '--disable-dev-shm-usage']
+                )
+                context = browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    locale='zh-CN'
+                )
+                page = context.new_page()
+                page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                page.wait_for_timeout(1500)
+                html = page.content()
+                browser.close()
+
+            soup = BeautifulSoup(html, 'html.parser')
             title = self._extract_title(soup)
             author = self._extract_author(soup)
             content = self._extract_and_format_content(soup)
-            
             if content and len(content) > 100:
                 return {
                     'success': True,
                     'title': title or '未获取到标题',
                     'author': author or '未知作者',
                     'content': content,
-                    'raw_html': str(soup)
+                    'raw_html': html,
+                    'source_url': url,
+                    'fetched_by': 'browser_fallback'
                 }
-            
+            return {'success': False, 'error': f'浏览器抓取内容不足(len={len(content) if content else 0})'}
         except Exception as e:
-            print(f"❌ 抓取失败: {e}")
-        
-        return {'success': False}
-    
+            return {'success': False, 'error': str(e)}
+
+    def print_article_to_pdf_via_browser(self, url, output_path):
+        """使用浏览器打印（page.pdf）直接生成PDF"""
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as e:
+            return {'success': False, 'error': f'Playwright不可用: {e}'}
+
+        try:
+            output_path = str(output_path)
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                context = browser.new_context(locale='zh-CN')
+                page = context.new_page()
+                page.goto(url, wait_until='domcontentloaded', timeout=45000)
+                page.wait_for_timeout(2000)
+
+                # 尝试提取标题/作者
+                title = page.title() or '未命名文章'
+                author = '未知作者'
+                for sel in ['#js_name', '.account_nickname_inner', '.profile_nickname', '.rich_media_meta_text']:
+                    try:
+                        t = page.locator(sel).first.inner_text(timeout=800)
+                        if t and t.strip():
+                            author = t.strip()
+                            break
+                    except Exception:
+                        pass
+
+                page.pdf(
+                    path=output_path,
+                    format='A4',
+                    print_background=True,
+                    margin={'top': '15mm', 'right': '12mm', 'bottom': '15mm', 'left': '12mm'}
+                )
+                browser.close()
+
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                return {
+                    'success': True,
+                    'pdf_path': output_path,
+                    'title': title,
+                    'author': author
+                }
+            return {'success': False, 'error': '浏览器打印生成文件为空'}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
     def _extract_title(self, soup):
         """提取标题"""
         selectors = [
@@ -142,7 +351,7 @@ class WeChatArticleFixer:
         return None
     
     def _format_content_properly(self, element):
-        """正确格式化内容，确保段落分隔"""
+        """正确格式化内容，保留加粗和斜体格式"""
         # 创建副本以避免修改原始元素
         element = BeautifulSoup(str(element), 'html.parser')
         
@@ -157,36 +366,31 @@ class WeChatArticleFixer:
             if h_text:
                 h.string = f"{'#' * level} {h_text}\n\n"
         
-        # 转换段落 - 确保正确的段落分隔
+        # 转换段落 - 保留格式标记（含 style/class 的粗体斜体）
         paragraphs = []
         for p in element.find_all('p'):
-            p_text = p.get_text().strip()
+            p_text = self._extract_formatted_text(p)
             if p_text:
-                # 清理文本
-                p_text = re.sub(r'\s+', ' ', p_text)
                 paragraphs.append(p_text)
         
         # 转换列表
         for ul in element.find_all('ul'):
-            for li in ul.find_all('li'):
-                li_text = li.get_text().strip()
+            for li in ul.find_all('li', recursive=False):
+                li_text = self._extract_formatted_text(li)
                 if li_text:
                     paragraphs.append(f"- {li_text}")
         
         for ol in element.find_all('ol'):
-            for i, li in enumerate(ol.find_all('li'), 1):
-                li_text = li.get_text().strip()
+            for i, li in enumerate(ol.find_all('li', recursive=False), 1):
+                li_text = self._extract_formatted_text(li)
                 if li_text:
                     paragraphs.append(f"{i}. {li_text}")
         
         # 转换引用
         for blockquote in element.find_all('blockquote'):
-            quote_text = blockquote.get_text().strip()
+            quote_text = self._extract_formatted_text(blockquote)
             if quote_text:
                 paragraphs.append(f"> {quote_text}")
-        
-        # 转换加粗
-        # 这里我们不在文本层面处理加粗，让PDF生成器处理
         
         # 构建最终文本
         formatted_text = []
@@ -199,6 +403,77 @@ class WeChatArticleFixer:
                 formatted_text.append(para)
         
         return '\n\n'.join(formatted_text)
+
+    def _extract_formatted_text(self, node):
+        """递归提取文本，并保留粗体/斜体（标签与样式）为 Markdown 标记"""
+        if not node:
+            return ""
+
+        if isinstance(node, NavigableString):
+            text = str(node)
+            text = re.sub(r'\s+', ' ', text)
+            return text
+
+        if not isinstance(node, Tag):
+            return ""
+
+        parts = [self._extract_formatted_text(child) for child in node.children]
+        text = ''.join(parts)
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        if not text:
+            return ""
+
+        is_bold = self._is_bold_like(node)
+        is_italic = self._is_italic_like(node)
+
+        if is_bold and is_italic:
+            return f"***{text}***"
+        if is_bold:
+            return f"**{text}**"
+        if is_italic:
+            return f"*{text}*"
+
+        return text
+
+    def _is_bold_like(self, tag):
+        """判断节点是否应视为粗体（标签、style、class）"""
+        if not isinstance(tag, Tag):
+            return False
+
+        if tag.name in ['strong', 'b']:
+            return True
+
+        style = (tag.get('style') or '').lower()
+        classes = ' '.join(tag.get('class', [])).lower()
+
+        if 'font-weight' in style:
+            if 'bold' in style or re.search(r'font-weight\s*:\s*([6-9]00|[1-9]\d{2,})', style):
+                return True
+
+        if any(k in classes for k in ['bold', 'font-weight', 'fw-bold']):
+            return True
+
+        return False
+
+    def _is_italic_like(self, tag):
+        """判断节点是否应视为斜体（标签、style、class）"""
+        if not isinstance(tag, Tag):
+            return False
+
+        if tag.name in ['em', 'i']:
+            return True
+
+        style = (tag.get('style') or '').lower()
+        classes = ' '.join(tag.get('class', [])).lower()
+
+        if 'font-style' in style and 'italic' in style:
+            return True
+
+        if any(k in classes for k in ['italic', 'oblique']):
+            return True
+
+        return False
     
     def _add_paragraph_breaks(self, text):
         """为长文本添加段落分隔"""
@@ -284,7 +559,7 @@ class WeChatArticleFixer:
         print(f"📊 作者统计更新: {author_name} ({author_data['total_articles']}篇文章)")
         return author_data
     
-    def process_article(self, url, custom_title=None):
+    def process_article(self, url, custom_title=None, use_browser_fallback=False, use_remote_fallback=False):
         """处理文章"""
         print("=" * 70)
         print("🤖 修复版微信公众号文章处理系统")
@@ -296,7 +571,11 @@ class WeChatArticleFixer:
         
         # 抓取文章
         print("\n🔄 抓取并格式化文章内容...")
-        fetched_data = self.fetch_article(url)
+        fetched_data = self.fetch_article(
+            url,
+            use_browser_fallback=use_browser_fallback,
+            use_remote_fallback=use_remote_fallback
+        )
         
         if fetched_data['success']:
             print("✅ 成功抓取并格式化文章内容")

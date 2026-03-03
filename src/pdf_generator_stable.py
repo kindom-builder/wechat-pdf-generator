@@ -429,8 +429,10 @@ HTML_TEMPLATE = '''
         .file-info { flex: 1; }
         .file-name { font-weight: 500; margin-bottom: 4px; word-break: break-all; }
         .file-meta { font-size: 14px; color: #7f8c8d; }
-        .btn-download { background: #27ae60; color: white; border: none; padding: 6px 12px; border-radius: 3px; text-decoration: none; font-size: 14px; }
+        .btn-download { background: #27ae60; color: white; border: none; padding: 6px 12px; border-radius: 3px; text-decoration: none; font-size: 14px; margin-right: 6px; }
         .btn-download:hover { background: #219653; }
+        .btn-preview { background: #8e44ad; color: white; border: none; padding: 6px 12px; border-radius: 3px; text-decoration: none; font-size: 14px; }
+        .btn-preview:hover { background: #7d3c98; }
         .footer { text-align: center; padding: 20px; color: #7f8c8d; margin-top: 30px; }
         .stability-badge { display: inline-block; background: #27ae60; color: white; padding: 3px 8px; border-radius: 3px; font-size: 12px; margin-left: 10px; }
     </style>
@@ -593,6 +595,11 @@ HTML_TEMPLATE = '''
                                     ${file.size_mb} MB • ${file.created}
                                 </div>
                             </div>
+                            <a href="${this.apiBase}/api/preview/${encodedName}" 
+                               class="btn-preview" 
+                               target="_blank">
+                                预览
+                            </a>
                             <a href="${this.apiBase}/api/download/${encodedName}" 
                                class="btn-download" 
                                download="${file.name}">
@@ -670,6 +677,12 @@ HTML_TEMPLATE = '''
                         
                         infoHtml += `
                                 <br>
+                                <a href="${this.apiBase}/api/preview/${encodedName}" 
+                                   class="btn-preview" 
+                                   target="_blank"
+                                   style="display: inline-block; margin-top: 10px; margin-right: 8px;">
+                                    在线预览PDF
+                                </a>
                                 <a href="${this.apiBase}/api/download/${encodedName}" 
                                    class="btn-download" 
                                    download="${fileName}"
@@ -788,6 +801,38 @@ def generate_pdf():
         return jsonify({
             "success": False,
             "message": "处理文章失败",
+            "error": str(e)
+        }), 500
+
+@app.route('/api/preview/<filename>', methods=['GET'])
+@limiter.limit("30 per minute")
+def preview_pdf(filename):
+    """在线预览PDF文件"""
+    try:
+        import urllib.parse
+        filename = urllib.parse.unquote(filename)
+
+        pdf_path = generator.base_dir / "pdfs" / filename
+
+        if pdf_path.exists():
+            response = send_file(
+                pdf_path,
+                as_attachment=False,
+                mimetype='application/pdf'
+            )
+            # 避免中文文件名在开发服务器header编码报错（latin-1限制）
+            response.headers['Content-Disposition'] = 'inline'
+            return response
+        else:
+            return jsonify({
+                "success": False,
+                "message": f"文件不存在: {filename}"
+            }), 404
+    except Exception as e:
+        logger.error(f"预览文件失败: {str(e)}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "message": "预览文件失败",
             "error": str(e)
         }), 500
 

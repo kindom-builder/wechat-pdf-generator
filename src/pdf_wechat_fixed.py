@@ -29,40 +29,65 @@ class FixedWeChatPDFGenerator:
         self.page_width, self.page_height = A4
         
     def setup_fonts(self):
-        """设置字体"""
+        """设置字体（含粗体/斜体家族映射，确保<b>/<i>在PDF中可见）"""
         try:
-            # 注册多种字体
-            font_paths = [
-                "/mnt/c/Windows/Fonts/msyh.ttc",      # 微软雅黑（正文）
-                "/mnt/c/Windows/Fonts/simsun.ttc",    # 宋体（标题备用）
-                "/mnt/c/Windows/Fonts/simhei.ttf",    # 黑体（强调）
-                "/mnt/c/Windows/Fonts/simkai.ttf",    # 楷体（引用）
-            ]
-            
+            # 主字体及变体
+            font_map = {
+                'normal': "/mnt/c/Windows/Fonts/msyh.ttc",      # 微软雅黑 Regular
+                'bold': "/mnt/c/Windows/Fonts/msyhbd.ttc",      # 微软雅黑 Bold
+                'italic': "/mnt/c/Windows/Fonts/simkai.ttf",    # 楷体近似斜体
+                'boldItalic': "/mnt/c/Windows/Fonts/simhei.ttf" # 黑体近似粗斜体
+            }
+
             self.registered_fonts = {}
-            for font_path in font_paths:
+            for role, font_path in font_map.items():
                 if os.path.exists(font_path):
                     font_name = os.path.basename(font_path).split('.')[0]
                     try:
                         pdfmetrics.registerFont(TTFont(font_name, font_path))
-                        self.registered_fonts[font_name] = font_path
-                        print(f"✅ 注册字体: {font_name}")
-                    except:
-                        continue
-            
-            if 'msyh' in self.registered_fonts:
-                self.main_font = 'msyh'  # 微软雅黑
-                self.title_font = 'msyh'  # 标题也用微软雅黑
-                self.quote_font = 'simkai' if 'simkai' in self.registered_fonts else 'msyh'  # 楷体或微软雅黑
+                        self.registered_fonts[role] = font_name
+                        print(f"✅ 注册字体({role}): {font_name}")
+                    except Exception:
+                        pass
+
+            # 额外备用字体
+            for extra_path in ["/mnt/c/Windows/Fonts/simsun.ttc"]:
+                if os.path.exists(extra_path):
+                    try:
+                        extra_name = os.path.basename(extra_path).split('.')[0]
+                        pdfmetrics.registerFont(TTFont(extra_name, extra_path))
+                        print(f"✅ 注册字体: {extra_name}")
+                    except Exception:
+                        pass
+
+            if 'normal' in self.registered_fonts:
+                normal = self.registered_fonts.get('normal')
+                bold = self.registered_fonts.get('bold', normal)
+                italic = self.registered_fonts.get('italic', normal)
+                bold_italic = self.registered_fonts.get('boldItalic', bold)
+
+                # 直接保留各变体字体名，后续在create_paragraph里显式替换为font标签
+                self.main_font = normal
+                self.bold_font = bold
+                self.italic_font = italic
+                self.bold_italic_font = bold_italic
+                self.title_font = bold
+                self.quote_font = italic
             else:
-                print("⚠️ 未找到微软雅黑字体，使用Helvetica")
+                print("⚠️ 未找到可用中文字体，使用Helvetica家族")
                 self.main_font = "Helvetica"
+                self.bold_font = "Helvetica-Bold"
+                self.italic_font = "Helvetica-Oblique"
+                self.bold_italic_font = "Helvetica-Bold"
                 self.title_font = "Helvetica-Bold"
                 self.quote_font = "Helvetica-Oblique"
-            
+
         except Exception as e:
             print(f"❌ 字体设置失败: {e}")
             self.main_font = "Helvetica"
+            self.bold_font = "Helvetica-Bold"
+            self.italic_font = "Helvetica-Oblique"
+            self.bold_italic_font = "Helvetica-Bold"
             self.title_font = "Helvetica-Bold"
             self.quote_font = "Helvetica-Oblique"
     
@@ -113,6 +138,22 @@ class FixedWeChatPDFGenerator:
             textColor=colors.HexColor('#222222'),
             firstLineIndent=26,  # 首行缩进2字符（13px * 2）
             wordWrap='CJK'  # 中文换行
+        ))
+        
+        # 加粗正文段落（用于强调段落）
+        self.styles.add(ParagraphStyle(
+            name='WeChatBodyBold',
+            parent=self.styles['Normal'],
+            fontName=self.main_font,
+            fontSize=13,  # 保持13px
+            leading=17.5, # 1.35倍行距（微调，更紧凑）
+            spaceAfter=8,  # 段后间距（进一步减小）
+            alignment=TA_JUSTIFY,  # 两端对齐
+            textColor=colors.HexColor('#111111'),  # 更深的颜色
+            firstLineIndent=26,  # 首行缩进2字符（13px * 2）
+            wordWrap='CJK',  # 中文换行
+            fontNameBold=self.main_font,
+            bold=True
         ))
         
         # 一级标题（文章内）
@@ -382,16 +423,44 @@ class FixedWeChatPDFGenerator:
         return elements
     
     def create_paragraph(self, text):
-        """创建段落，处理行内格式"""
+        """创建段落，处理行内格式（显式字体，避免<b>/<i>在中文字体下失效）"""
         # 处理行内代码
         text = re.sub(r'`([^`]+)`', r'<font name="Courier" color="#E74C3C" backcolor="#FDF2F2">\1</font>', text)
-        
-        # 处理加粗（**text**）
-        text = re.sub(r'\*\*([^*]+)\*\*', r'<b>\1</b>', text)
-        
-        # 处理斜体（*text*）
-        text = re.sub(r'\*([^*]+)\*', r'<i>\1</i>', text)
-        
+
+        # 顺序很重要：先处理粗斜体，再处理粗体，再处理斜体
+        text = re.sub(
+            r'\*\*\*([^*]+)\*\*\*',
+            lambda m: f'<font name="{self.bold_italic_font}">{m.group(1)}</font>',
+            text
+        )
+        text = re.sub(
+            r'___([^_]+)___',
+            lambda m: f'<font name="{self.bold_italic_font}">{m.group(1)}</font>',
+            text
+        )
+
+        text = re.sub(
+            r'\*\*([^*]+)\*\*',
+            lambda m: f'<font name="{self.bold_font}">{m.group(1)}</font>',
+            text
+        )
+        text = re.sub(
+            r'__([^_]+)__',
+            lambda m: f'<font name="{self.bold_font}">{m.group(1)}</font>',
+            text
+        )
+
+        text = re.sub(
+            r'\*([^*]+)\*',
+            lambda m: f'<font name="{self.italic_font}">{m.group(1)}</font>',
+            text
+        )
+        text = re.sub(
+            r'_([^_]+)_',
+            lambda m: f'<font name="{self.italic_font}">{m.group(1)}</font>',
+            text
+        )
+
         return Paragraph(text, self.styles['WeChatBody'])
     
     def create_cover_page(self, title, author, meta_info=None):
